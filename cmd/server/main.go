@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"log/slog"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -15,6 +18,7 @@ import (
 	"shardscale/internal/api"
 	"shardscale/internal/metrics"
 	"shardscale/internal/node"
+	"shardscale/internal/router"
 	"shardscale/internal/server"
 )
 
@@ -76,11 +80,11 @@ func main() {
 	defer stop()
 
 	// Create node with hash ring
-	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, logger)
-
-	// Create metrics and handlers
 	metricCollector := metrics.New()
-	handlers := api.NewHandlers(n.Router, metricCollector, logger)
+	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, metricCollector, logger)
+
+	// Create handlers
+	handlers := api.NewHandlers(n.Router, n.Rebalancer, metricCollector, logger)
 
 	// Create and start HTTP server
 	httpServer := server.New(*nodeAddr, logger, handlers, metricCollector)
@@ -89,6 +93,8 @@ func main() {
 	go func() {
 		serverErr <- httpServer.Run()
 	}()
+
+	go broadcastJoin(*nodeID, *nodeAddr, n.Router, logger)
 
 	select {
 	case <-ctx.Done():
@@ -114,4 +120,51 @@ func main() {
 	}
 
 	logger.Info("server stopped cleanly")
+}
+
+func broadcastJoin(selfID, selfAddr string, r *router.Router, logger *slog.Logger) {
+	peers := r.PeerSnapshot()
+	payload, err := json.Marshal(map[string]string{
+		"node_id":   selfID,
+		"node_addr": selfAddr,
+	})
+	if err != nil {
+		logger.Warn("failed to marshal join payload", slog.String("error", err.Error()))
+		return
+	}
+
+	client := &http.Client{Timeout: 2 * time.Second}
+	for nodeID, addr := range peers {
+		if nodeID == selfID {
+			continue
+		}
+
+		req, err := http.NewRequest(http.MethodPost, "http://"+addr+"/internal/join", bytes.NewReader(payload))
+		if err != nil {
+			logger.Warn("failed creating join request",
+				slog.String("target_node", nodeID),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			logger.Warn("join broadcast failed",
+				slog.String("target_node", nodeID),
+				slog.String("addr", addr),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		_ = resp.Body.Close()
+
+		if resp.StatusCode != http.StatusOK {
+			logger.Warn("join broadcast returned non-200",
+				slog.String("target_node", nodeID),
+				slog.Int("status", resp.StatusCode),
+			)
+		}
+	}
 }

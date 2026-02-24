@@ -57,3 +57,33 @@ func (s *Store) Count() int {
 	s.mu.RUnlock()
 	return count
 }
+
+func (s *Store) Delete(ctx context.Context, key string) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, ok := s.data[key]; !ok {
+		return ErrNotFound
+	}
+
+	delete(s.data, key)
+	return nil
+}
+
+func (s *Store) Snapshot() map[string]string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	copyData := make(map[string]string, len(s.data))
+	for key, value := range s.data {
+		copyData[key] = value
+	}
+
+	return copyData
+}

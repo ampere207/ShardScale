@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"shardscale/internal/ring"
@@ -18,18 +19,24 @@ import (
 type Router struct {
 	SelfID     string
 	Peers      map[string]string // nodeID -> address
+	peersMu    *sync.RWMutex
 	store      *store.Store
 	ring       *ring.HashRing
 	httpClient *http.Client
 	logger     *slog.Logger
 }
 
-func New(selfID string, peers map[string]string, s *store.Store, hashRing *ring.HashRing, logger *slog.Logger) *Router {
+func New(selfID string, peers map[string]string, peersMu *sync.RWMutex, s *store.Store, hashRing *ring.HashRing, logger *slog.Logger) *Router {
+	if peersMu == nil {
+		peersMu = &sync.RWMutex{}
+	}
+
 	return &Router{
-		SelfID: selfID,
-		Peers:  peers,
-		store:  s,
-		ring:   hashRing,
+		SelfID:  selfID,
+		Peers:   peers,
+		peersMu: peersMu,
+		store:   s,
+		ring:    hashRing,
 		httpClient: &http.Client{
 			Timeout: 3 * time.Second,
 		},
@@ -90,9 +97,44 @@ func (r *Router) Count() int {
 	return r.store.Count()
 }
 
+func (r *Router) DirectPut(ctx context.Context, key, value string) error {
+	return r.store.Put(ctx, key, value)
+}
+
+func (r *Router) AddOrUpdatePeer(nodeID, addr string) bool {
+	if nodeID == "" || addr == "" {
+		return false
+	}
+
+	r.peersMu.Lock()
+	defer r.peersMu.Unlock()
+
+	current, exists := r.Peers[nodeID]
+	if exists && current == addr {
+		return false
+	}
+
+	r.Peers[nodeID] = addr
+	return true
+}
+
+func (r *Router) PeerSnapshot() map[string]string {
+	r.peersMu.RLock()
+	defer r.peersMu.RUnlock()
+
+	copyMap := make(map[string]string, len(r.Peers))
+	for nodeID, addr := range r.Peers {
+		copyMap[nodeID] = addr
+	}
+
+	return copyMap
+}
+
 // forwardPut sends a PUT request to the owner node.
 func (r *Router) forwardPut(ctx context.Context, owner, key, value string) error {
+	r.peersMu.RLock()
 	addr, ok := r.Peers[owner]
+	r.peersMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("owner node not in peers: %s", owner)
 	}
@@ -127,7 +169,9 @@ func (r *Router) forwardPut(ctx context.Context, owner, key, value string) error
 
 // forwardGet sends a GET request to the owner node and returns the value.
 func (r *Router) forwardGet(ctx context.Context, owner, key string) (string, error) {
+	r.peersMu.RLock()
 	addr, ok := r.Peers[owner]
+	r.peersMu.RUnlock()
 	if !ok {
 		return "", fmt.Errorf("owner node not in peers: %s", owner)
 	}

@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"shardscale/internal/metrics"
+	"shardscale/internal/rebalance"
 	"shardscale/internal/router"
 	"shardscale/internal/store"
 )
@@ -31,20 +32,33 @@ type errorResponse struct {
 	Error string `json:"error"`
 }
 
-type Handlers struct {
-	router  *router.Router
-	metrics *metrics.Metrics
-	logger  *slog.Logger
+type transferRequest struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
 }
 
-func NewHandlers(r *router.Router, m *metrics.Metrics, logger *slog.Logger) *Handlers {
-	return &Handlers{router: r, metrics: m, logger: logger}
+type joinRequest struct {
+	NodeID   string `json:"node_id"`
+	NodeAddr string `json:"node_addr"`
+}
+
+type Handlers struct {
+	router     *router.Router
+	rebalancer *rebalance.Rebalancer
+	metrics    *metrics.Metrics
+	logger     *slog.Logger
+}
+
+func NewHandlers(r *router.Router, rb *rebalance.Rebalancer, m *metrics.Metrics, logger *slog.Logger) *Handlers {
+	return &Handlers{router: r, rebalancer: rb, metrics: m, logger: logger}
 }
 
 func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/kv/", h.handleKV)
 	mux.HandleFunc("/metrics", h.handleMetrics)
 	mux.HandleFunc("/health", h.handleHealth)
+	mux.HandleFunc("/internal/transfer", h.handleInternalTransfer)
+	mux.HandleFunc("/internal/join", h.handleInternalJoin)
 }
 
 func (h *Handlers) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -167,6 +181,92 @@ func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Allow", "GET")
 		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
 		return
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+func (h *Handlers) handleInternalTransfer(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	h.metrics.TotalWrites.Add(1)
+	defer r.Body.Close()
+
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var req transferRequest
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		return
+	}
+
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "request body must contain a single JSON object"})
+		return
+	}
+
+	req.Key = strings.TrimSpace(req.Key)
+	if req.Key == "" || strings.Contains(req.Key, "/") {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "key must be non-empty and must not contain '/'"})
+		return
+	}
+
+	if strings.TrimSpace(req.Value) == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "value must be non-empty"})
+		return
+	}
+
+	if err := h.router.DirectPut(r.Context(), req.Key, req.Value); err != nil {
+		h.metrics.FailedRequests.Add(1)
+		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "failed to store transfer"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+func (h *Handlers) handleInternalJoin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var req joinRequest
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		return
+	}
+
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "request body must contain a single JSON object"})
+		return
+	}
+
+	req.NodeID = strings.TrimSpace(req.NodeID)
+	req.NodeAddr = strings.TrimSpace(req.NodeAddr)
+	if req.NodeID == "" || req.NodeAddr == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "node_id and node_addr are required"})
+		return
+	}
+
+	changed := h.router.AddOrUpdatePeer(req.NodeID, req.NodeAddr)
+	if changed {
+		h.rebalancer.RebuildRingFromPeers()
+		h.rebalancer.StartRebalance()
+		h.logger.Info("cluster join processed",
+			slog.String("node_id", req.NodeID),
+			slog.String("node_addr", req.NodeAddr),
+		)
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
