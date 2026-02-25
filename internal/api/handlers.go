@@ -64,6 +64,7 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/metrics", h.handleMetrics)
 	mux.HandleFunc("/health", h.handleHealth)
 	mux.HandleFunc("/internal/transfer", h.handleInternalTransfer)
+	mux.HandleFunc("/internal/replicate", h.handleInternalReplicate)
 	mux.HandleFunc("/internal/join", h.handleInternalJoin)
 	mux.HandleFunc("/internal/heartbeat", h.handleInternalHeartbeat)
 }
@@ -129,7 +130,17 @@ func (h *Handlers) handlePut(w http.ResponseWriter, r *http.Request, key string)
 			writeJSON(w, http.StatusRequestTimeout, errorResponse{Error: err.Error()})
 			return
 		}
+		var statusErr *router.StatusError
+		if errors.As(err, &statusErr) {
+			h.metrics.FailedRequests.Add(1)
+			writeJSON(w, statusErr.Code, errorResponse{Error: "failed to process request"})
+			return
+		}
 		h.metrics.FailedRequests.Add(1)
+		if h.router.KeyOwner(key) == h.router.SelfID {
+			writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "failed to process request"})
+			return
+		}
 		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "failed to process request"})
 		return
 	}
@@ -161,6 +172,12 @@ func (h *Handlers) handleGet(w http.ResponseWriter, r *http.Request, key string)
 			writeJSON(w, http.StatusNotFound, errorResponse{Error: "key not found"})
 			return
 		}
+		var statusErr *router.StatusError
+		if errors.As(err, &statusErr) {
+			h.metrics.FailedRequests.Add(1)
+			writeJSON(w, statusErr.Code, errorResponse{Error: "failed to process request"})
+			return
+		}
 		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 			writeJSON(w, http.StatusRequestTimeout, errorResponse{Error: err.Error()})
 			return
@@ -181,7 +198,7 @@ func (h *Handlers) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	}
 
 	activeNodes := len(h.router.PeerSnapshot())
-	writeJSON(w, http.StatusOK, h.metrics.Snapshot(h.router.Count(), activeNodes))
+	writeJSON(w, http.StatusOK, h.metrics.Snapshot(h.router.Count(), activeNodes, h.router.ReplicationFactor()))
 }
 
 func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -232,6 +249,48 @@ func (h *Handlers) handleInternalTransfer(w http.ResponseWriter, r *http.Request
 	if err := h.router.DirectPut(r.Context(), req.Key, req.Value); err != nil {
 		h.metrics.FailedRequests.Add(1)
 		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "failed to store transfer"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+func (h *Handlers) handleInternalReplicate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	defer r.Body.Close()
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var req transferRequest
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON body"})
+		return
+	}
+
+	if err := decoder.Decode(&struct{}{}); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "request body must contain a single JSON object"})
+		return
+	}
+
+	req.Key = strings.TrimSpace(req.Key)
+	if req.Key == "" || strings.Contains(req.Key, "/") {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "key must be non-empty and must not contain '/'"})
+		return
+	}
+
+	if strings.TrimSpace(req.Value) == "" {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "value must be non-empty"})
+		return
+	}
+
+	if err := h.router.DirectPut(r.Context(), req.Key, req.Value); err != nil {
+		h.metrics.FailedRequests.Add(1)
+		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "failed to store replica"})
 		return
 	}
 

@@ -35,9 +35,9 @@ type Rebalancer struct {
 }
 
 type transferTask struct {
-	owner string
-	key   string
-	value string
+	owners []string
+	key    string
+	value  string
 }
 
 type transferRequest struct {
@@ -63,6 +63,13 @@ func New(nodeID string, hashRing *ring.HashRing, s *store.Store, peers map[strin
 		retryLimit:  3,
 		inProgress:  false,
 	}
+}
+
+func (r *Rebalancer) ReplicationFactor() int {
+	if r.metrics == nil {
+		return 1
+	}
+	return r.metrics.GetReplicationFactor()
 }
 
 func (r *Rebalancer) StartRebalance() {
@@ -153,12 +160,12 @@ func (r *Rebalancer) run(startedAt time.Time) {
 
 	queued := 0
 	for key, value := range snapshot {
-		owner := r.Ring.GetOwner(key)
-		if owner == "" || owner == r.NodeID {
+		owners := r.Ring.GetOwners(key, r.ReplicationFactor())
+		if len(owners) == 0 {
 			continue
 		}
 
-		jobs <- transferTask{owner: owner, key: key, value: value}
+		jobs <- transferTask{owners: owners, key: key, value: value}
 		queued++
 	}
 	close(jobs)
@@ -181,10 +188,34 @@ func (r *Rebalancer) run(startedAt time.Time) {
 }
 
 func (r *Rebalancer) processTask(task transferTask) {
-	if !r.transferWithRetry(task.owner, task.key, task.value) {
+	if len(task.owners) == 0 {
+		return
+	}
+
+	primary := task.owners[0]
+	if primary == "" {
+		return
+	}
+
+	if !containsOwner(task.owners, r.NodeID) {
+		r.transferOutToPrimary(task, primary)
+		return
+	}
+
+	if primary != r.NodeID {
+		return
+	}
+
+	if r.ensureReplicas(task.key, task.value, task.owners[1:]) {
+		r.metrics.IncReplicaSyncEventsTotal()
+	}
+}
+
+func (r *Rebalancer) transferOutToPrimary(task transferTask, primary string) {
+	if !r.transferWithRetry(primary, task.key, task.value) {
 		r.logger.Warn("key transfer failed after retries; key retained locally",
 			slog.String("key", task.key),
-			slog.String("target_owner", task.owner),
+			slog.String("target_owner", primary),
 		)
 		return
 	}
@@ -225,6 +256,81 @@ func (r *Rebalancer) processTask(task transferTask) {
 
 	migrated := r.migrated.Add(1)
 	r.metrics.SetKeysMigrated(migrated)
+}
+
+func (r *Rebalancer) ensureReplicas(key, value string, replicas []string) bool {
+	for _, replicaID := range replicas {
+		if replicaID == "" || replicaID == r.NodeID {
+			continue
+		}
+
+		if !r.replicateWithRetry(replicaID, key, value) {
+			r.metrics.IncReplicaFailuresTotal()
+			r.logger.Warn("replica sync failed during rebalance",
+				slog.String("key", key),
+				slog.String("replica", replicaID),
+			)
+			return false
+		}
+		r.metrics.IncReplicaWritesTotal()
+	}
+
+	return true
+}
+
+func (r *Rebalancer) replicateWithRetry(replicaID, key, value string) bool {
+	for attempt := 1; attempt <= r.retryLimit; attempt++ {
+		if err := r.replicateOnce(replicaID, key, value); err == nil {
+			return true
+		}
+		time.Sleep(time.Duration(attempt) * 150 * time.Millisecond)
+	}
+
+	return false
+}
+
+func (r *Rebalancer) replicateOnce(replicaID, key, value string) error {
+	r.peersMu.RLock()
+	addr, ok := r.Peers[replicaID]
+	r.peersMu.RUnlock()
+	if !ok {
+		return errors.New("replica owner is not in peer map")
+	}
+
+	payload, err := json.Marshal(transferRequest{Key: key, Value: value})
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+"/internal/replicate", bytes.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := r.HTTPClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return errors.New("replication endpoint returned non-200")
+	}
+
+	return nil
+}
+
+func containsOwner(owners []string, nodeID string) bool {
+	for _, owner := range owners {
+		if owner == nodeID {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *Rebalancer) transferWithRetry(owner, key, value string) bool {

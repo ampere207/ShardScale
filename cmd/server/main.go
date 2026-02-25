@@ -31,6 +31,7 @@ func main() {
 	nodeAddr := flag.String("node-addr", os.Getenv("NODE_ADDR"), "Node address (default from NODE_ADDR env)")
 	peersStr := flag.String("peers", os.Getenv("PEERS"), "Peers in format node2=addr2,node3=addr3")
 	virtualNodesStr := flag.String("virtual-nodes", os.Getenv("VIRTUAL_NODES"), "Virtual nodes per physical node (default 50)")
+	replicationFactorStr := flag.String("replication-factor", os.Getenv("REPLICATION_FACTOR"), "Replication factor (default 2)")
 	heartbeatIntervalStr := flag.String("heartbeat-interval", os.Getenv("HEARTBEAT_INTERVAL"), "Heartbeat interval (default 2s)")
 	heartbeatTimeoutStr := flag.String("heartbeat-timeout", os.Getenv("HEARTBEAT_TIMEOUT"), "Heartbeat timeout (default 6s)")
 	flag.Parse()
@@ -47,6 +48,18 @@ func main() {
 		if parsed, err := strconv.Atoi(*virtualNodesStr); err == nil && parsed > 0 {
 			virtualNodes = parsed
 		}
+	}
+
+	replicationFactor := 2
+	if *replicationFactorStr != "" {
+		parsed, err := strconv.Atoi(*replicationFactorStr)
+		if err != nil || parsed < 1 {
+			logger.Error("invalid replication factor",
+				slog.String("value", *replicationFactorStr),
+			)
+			os.Exit(1)
+		}
+		replicationFactor = parsed
 	}
 
 	// Parse heartbeat timings
@@ -101,6 +114,7 @@ func main() {
 		slog.String("node_addr", *nodeAddr),
 		slog.Any("peers", peers),
 		slog.Int("virtual_nodes", virtualNodes),
+		slog.Int("replication_factor", replicationFactor),
 		slog.Duration("heartbeat_interval", heartbeatInterval),
 		slog.Duration("heartbeat_timeout", heartbeatTimeout),
 	)
@@ -110,7 +124,8 @@ func main() {
 
 	// Create node with hash ring
 	metricCollector := metrics.New()
-	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, heartbeatInterval, heartbeatTimeout, metricCollector, logger)
+	metricCollector.SetReplicationFactor(replicationFactor)
+	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, replicationFactor, heartbeatInterval, heartbeatTimeout, metricCollector, logger)
 
 	// Create handlers
 	handlers := api.NewHandlers(n.Router, n.Rebalancer, metricCollector, logger)

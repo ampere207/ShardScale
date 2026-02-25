@@ -26,7 +26,7 @@ type Node struct {
 	Membership *membership.Membership
 }
 
-func New(id, addr string, peers map[string]string, virtualNodes int, heartbeatInterval, heartbeatTimeout time.Duration, m *metrics.Metrics, logger *slog.Logger) *Node {
+func New(id, addr string, peers map[string]string, virtualNodes int, replicationFactor int, heartbeatInterval, heartbeatTimeout time.Duration, m *metrics.Metrics, logger *slog.Logger) *Node {
 	s := store.New()
 
 	// Build hash ring with all nodes (self + peers)
@@ -38,7 +38,7 @@ func New(id, addr string, peers map[string]string, virtualNodes int, heartbeatIn
 	hashRing.Rebuild(nodeList)
 
 	member := membership.New(id, peers, hashRing, nil, m, logger, heartbeatInterval, heartbeatTimeout)
-	r := router.New(id, peers, member.PeerLock(), s, hashRing, logger)
+	r := router.New(id, peers, member.PeerLock(), s, hashRing, replicationFactor, m, logger)
 	rebalancer := rebalance.New(id, hashRing, s, peers, member.PeerLock(), m, logger, 10)
 	member.Rebalancer = rebalancer
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -11,32 +12,49 @@ import (
 	"sync"
 	"time"
 
+	"shardscale/internal/metrics"
 	"shardscale/internal/ring"
 	"shardscale/internal/store"
 )
 
 // Router handles key ownership determination via consistent hashing and request routing.
 type Router struct {
-	SelfID     string
-	Peers      map[string]string // nodeID -> address
-	peersMu    *sync.RWMutex
-	store      *store.Store
-	ring       *ring.HashRing
-	httpClient *http.Client
-	logger     *slog.Logger
+	SelfID            string
+	Peers             map[string]string // nodeID -> address
+	peersMu           *sync.RWMutex
+	store             *store.Store
+	ring              *ring.HashRing
+	replicationFactor int
+	metrics           *metrics.Metrics
+	httpClient        *http.Client
+	logger            *slog.Logger
 }
 
-func New(selfID string, peers map[string]string, peersMu *sync.RWMutex, s *store.Store, hashRing *ring.HashRing, logger *slog.Logger) *Router {
+type StatusError struct {
+	Code    int
+	Message string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("status %d: %s", e.Code, e.Message)
+}
+
+func New(selfID string, peers map[string]string, peersMu *sync.RWMutex, s *store.Store, hashRing *ring.HashRing, replicationFactor int, m *metrics.Metrics, logger *slog.Logger) *Router {
 	if peersMu == nil {
 		peersMu = &sync.RWMutex{}
 	}
+	if replicationFactor < 1 {
+		replicationFactor = 1
+	}
 
 	return &Router{
-		SelfID:  selfID,
-		Peers:   peers,
-		peersMu: peersMu,
-		store:   s,
-		ring:    hashRing,
+		SelfID:            selfID,
+		Peers:             peers,
+		peersMu:           peersMu,
+		store:             s,
+		ring:              hashRing,
+		replicationFactor: replicationFactor,
+		metrics:           m,
 		httpClient: &http.Client{
 			Timeout: 3 * time.Second,
 		},
@@ -46,50 +64,108 @@ func New(selfID string, peers map[string]string, peersMu *sync.RWMutex, s *store
 
 // KeyOwner determines which node owns the given key using consistent hashing.
 func (r *Router) KeyOwner(key string) string {
-	owner := r.ring.GetOwner(key)
-
-	// Fallback to self if ring is empty or returns empty owner
-	if owner == "" {
-		r.logger.Warn("hash ring returned empty owner, defaulting to self",
+	owners := r.getOwners(key)
+	if len(owners) == 0 {
+		r.logger.Warn("hash ring returned empty owners, defaulting to self",
 			slog.String("key", key),
 			slog.String("self_id", r.SelfID),
 		)
 		return r.SelfID
 	}
 
-	return owner
+	return owners[0]
 }
 
 // Put stores a value locally or forwards to owner if necessary.
 func (r *Router) Put(ctx context.Context, key, value string) error {
-	owner := r.KeyOwner(key)
-
-	if owner == r.SelfID {
-		r.logger.Debug("put: handling locally", slog.String("key", key))
-		return r.store.Put(ctx, key, value)
+	owners := r.getOwners(key)
+	if len(owners) == 0 {
+		owners = []string{r.SelfID}
 	}
 
-	r.logger.Info("put: forwarding to owner",
-		slog.String("key", key),
-		slog.String("owner", owner),
-	)
-	return r.forwardPut(ctx, owner, key, value)
+	primary := owners[0]
+
+	if primary != r.SelfID {
+		r.logger.Info("put: forwarding to primary",
+			slog.String("key", key),
+			slog.String("primary", primary),
+		)
+		return r.forwardPut(ctx, primary, key, value)
+	}
+
+	r.logger.Debug("put: handling as primary", slog.String("key", key))
+	if err := r.store.Put(ctx, key, value); err != nil {
+		return err
+	}
+
+	for _, replicaID := range owners[1:] {
+		if err := r.replicateTo(ctx, replicaID, key, value); err != nil {
+			r.logger.Error("replica write failed",
+				slog.String("key", key),
+				slog.String("replica", replicaID),
+				slog.String("error", err.Error()),
+			)
+			if r.metrics != nil {
+				r.metrics.IncReplicaFailuresTotal()
+			}
+			return fmt.Errorf("replication failed for replica %s: %w", replicaID, err)
+		}
+		if r.metrics != nil {
+			r.metrics.IncReplicaWritesTotal()
+		}
+	}
+
+	return nil
 }
 
 // Get retrieves a value locally or forwards to owner if necessary.
 func (r *Router) Get(ctx context.Context, key string) (string, error) {
-	owner := r.KeyOwner(key)
+	owners := r.getOwners(key)
+	if len(owners) == 0 {
+		owners = []string{r.SelfID}
+	}
+	primary := owners[0]
 
-	if owner == r.SelfID {
-		r.logger.Debug("get: handling locally", slog.String("key", key))
+	if primary == r.SelfID {
+		r.logger.Debug("get: handling as primary", slog.String("key", key))
 		return r.store.Get(ctx, key)
 	}
 
-	r.logger.Info("get: forwarding to owner",
+	r.logger.Info("get: forwarding to primary",
 		slog.String("key", key),
-		slog.String("owner", owner),
+		slog.String("primary", primary),
 	)
-	return r.forwardGet(ctx, owner, key)
+
+	value, err := r.forwardGet(ctx, primary, key)
+	if err == nil {
+		return value, nil
+	}
+	if errors.Is(err, store.ErrNotFound) {
+		return "", store.ErrNotFound
+	}
+
+	for _, ownerID := range owners[1:] {
+		if ownerID == r.SelfID {
+			fallbackValue, localErr := r.store.Get(ctx, key)
+			if localErr == nil {
+				return fallbackValue, nil
+			}
+			if errors.Is(localErr, store.ErrNotFound) {
+				continue
+			}
+			return "", localErr
+		}
+
+		fallbackValue, fallbackErr := r.forwardGet(ctx, ownerID, key)
+		if fallbackErr == nil {
+			return fallbackValue, nil
+		}
+		if errors.Is(fallbackErr, store.ErrNotFound) {
+			continue
+		}
+	}
+
+	return "", err
 }
 
 // Count returns the count of local keys only.
@@ -130,6 +206,21 @@ func (r *Router) PeerSnapshot() map[string]string {
 	return copyMap
 }
 
+func (r *Router) ReplicationFactor() int {
+	if r.replicationFactor < 1 {
+		return 1
+	}
+	return r.replicationFactor
+}
+
+func (r *Router) getOwners(key string) []string {
+	owners := r.ring.GetOwners(key, r.replicationFactor)
+	if len(owners) == 0 {
+		return []string{r.SelfID}
+	}
+	return owners
+}
+
 // forwardPut sends a PUT request to the owner node.
 func (r *Router) forwardPut(ctx context.Context, owner, key, value string) error {
 	r.peersMu.RLock()
@@ -161,7 +252,7 @@ func (r *Router) forwardPut(ctx context.Context, owner, key, value string) error
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("forwarded put returned status %d: %s", resp.StatusCode, string(respBody))
+		return &StatusError{Code: resp.StatusCode, Message: string(respBody)}
 	}
 
 	return nil
@@ -196,7 +287,7 @@ func (r *Router) forwardGet(ctx context.Context, owner, key string) (string, err
 
 	if resp.StatusCode != http.StatusOK {
 		respBody, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("forwarded get returned status %d: %s", resp.StatusCode, string(respBody))
+		return "", &StatusError{Code: resp.StatusCode, Message: string(respBody)}
 	}
 
 	var respData struct {
@@ -207,4 +298,38 @@ func (r *Router) forwardGet(ctx context.Context, owner, key string) (string, err
 	}
 
 	return respData.Value, nil
+}
+
+func (r *Router) replicateTo(ctx context.Context, replicaID, key, value string) error {
+	r.peersMu.RLock()
+	addr, ok := r.Peers[replicaID]
+	r.peersMu.RUnlock()
+	if !ok {
+		return fmt.Errorf("replica node not in peers: %s", replicaID)
+	}
+
+	payload := map[string]string{"key": key, "value": value}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("marshal replication request failed: %w", err)
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "http://"+addr+"/internal/replicate", bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("create replication request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("replication request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("replication returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	return nil
 }

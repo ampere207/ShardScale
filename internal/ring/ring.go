@@ -126,6 +126,52 @@ func (hr *HashRing) GetOwner(key string) string {
 	return hr.hashToNode[hr.sortedHashes[idx]]
 }
 
+// GetOwners returns the primary owner followed by distinct replica owners.
+// Complexity: O(log N + R + D), where N=ring points, R=replicationFactor, D=duplicate virtual-node skips.
+func (hr *HashRing) GetOwners(key string, replicationFactor int) []string {
+	hr.mu.RLock()
+	defer hr.mu.RUnlock()
+
+	if len(hr.sortedHashes) == 0 {
+		return nil
+	}
+
+	if replicationFactor < 1 {
+		replicationFactor = 1
+	}
+
+	maxOwners := len(hr.nodeSet)
+	if maxOwners == 0 {
+		return nil
+	}
+	if replicationFactor > maxOwners {
+		replicationFactor = maxOwners
+	}
+
+	keyHash := fnv1a32(key)
+	idx := sort.Search(len(hr.sortedHashes), func(i int) bool {
+		return hr.sortedHashes[i] >= keyHash
+	})
+	if idx == len(hr.sortedHashes) {
+		idx = 0
+	}
+
+	owners := make([]string, 0, replicationFactor)
+	seen := make(map[string]struct{}, replicationFactor)
+
+	for offset := 0; offset < len(hr.sortedHashes) && len(owners) < replicationFactor; offset++ {
+		currentIdx := (idx + offset) % len(hr.sortedHashes)
+		nodeID := hr.hashToNode[hr.sortedHashes[currentIdx]]
+		if _, exists := seen[nodeID]; exists {
+			continue
+		}
+		seen[nodeID] = struct{}{}
+		owners = append(owners, nodeID)
+	}
+
+	return owners
+}
+
 // fnv1a32 computes FNV-1a 32-bit hash of the input string.
 // https://en.wikipedia.org/wiki/Fowler%E2%80%93Noll%E2%80%93Vo_hash_function
 func fnv1a32(input string) uint32 {
