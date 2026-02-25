@@ -31,6 +31,8 @@ func main() {
 	nodeAddr := flag.String("node-addr", os.Getenv("NODE_ADDR"), "Node address (default from NODE_ADDR env)")
 	peersStr := flag.String("peers", os.Getenv("PEERS"), "Peers in format node2=addr2,node3=addr3")
 	virtualNodesStr := flag.String("virtual-nodes", os.Getenv("VIRTUAL_NODES"), "Virtual nodes per physical node (default 50)")
+	heartbeatIntervalStr := flag.String("heartbeat-interval", os.Getenv("HEARTBEAT_INTERVAL"), "Heartbeat interval (default 2s)")
+	heartbeatTimeoutStr := flag.String("heartbeat-timeout", os.Getenv("HEARTBEAT_TIMEOUT"), "Heartbeat timeout (default 6s)")
 	flag.Parse()
 
 	// Validate required config
@@ -45,6 +47,31 @@ func main() {
 		if parsed, err := strconv.Atoi(*virtualNodesStr); err == nil && parsed > 0 {
 			virtualNodes = parsed
 		}
+	}
+
+	// Parse heartbeat timings
+	heartbeatInterval := 2 * time.Second
+	if *heartbeatIntervalStr != "" {
+		parsed, err := time.ParseDuration(*heartbeatIntervalStr)
+		if err != nil || parsed <= 0 {
+			logger.Error("invalid heartbeat interval",
+				slog.String("value", *heartbeatIntervalStr),
+			)
+			os.Exit(1)
+		}
+		heartbeatInterval = parsed
+	}
+
+	heartbeatTimeout := 6 * time.Second
+	if *heartbeatTimeoutStr != "" {
+		parsed, err := time.ParseDuration(*heartbeatTimeoutStr)
+		if err != nil || parsed <= 0 {
+			logger.Error("invalid heartbeat timeout",
+				slog.String("value", *heartbeatTimeoutStr),
+			)
+			os.Exit(1)
+		}
+		heartbeatTimeout = parsed
 	}
 
 	// Parse PEERS environment variable
@@ -74,6 +101,8 @@ func main() {
 		slog.String("node_addr", *nodeAddr),
 		slog.Any("peers", peers),
 		slog.Int("virtual_nodes", virtualNodes),
+		slog.Duration("heartbeat_interval", heartbeatInterval),
+		slog.Duration("heartbeat_timeout", heartbeatTimeout),
 	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -81,7 +110,7 @@ func main() {
 
 	// Create node with hash ring
 	metricCollector := metrics.New()
-	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, metricCollector, logger)
+	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, heartbeatInterval, heartbeatTimeout, metricCollector, logger)
 
 	// Create handlers
 	handlers := api.NewHandlers(n.Router, n.Rebalancer, metricCollector, logger)
@@ -95,6 +124,7 @@ func main() {
 	}()
 
 	go broadcastJoin(*nodeID, *nodeAddr, n.Router, logger)
+	n.Membership.Start()
 
 	select {
 	case <-ctx.Done():
@@ -108,6 +138,8 @@ func main() {
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
+
+	n.Membership.Stop()
 
 	if err := httpServer.Shutdown(shutdownCtx); err != nil {
 		logger.Error("graceful shutdown failed", slog.String("error", err.Error()))

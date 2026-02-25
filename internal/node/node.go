@@ -3,7 +3,9 @@ package node
 import (
 	"log/slog"
 	"sync"
+	"time"
 
+	"shardscale/internal/membership"
 	"shardscale/internal/metrics"
 	"shardscale/internal/rebalance"
 	"shardscale/internal/ring"
@@ -21,11 +23,11 @@ type Node struct {
 	Router     *router.Router
 	Ring       *ring.HashRing
 	Rebalancer *rebalance.Rebalancer
+	Membership *membership.Membership
 }
 
-func New(id, addr string, peers map[string]string, virtualNodes int, m *metrics.Metrics, logger *slog.Logger) *Node {
+func New(id, addr string, peers map[string]string, virtualNodes int, heartbeatInterval, heartbeatTimeout time.Duration, m *metrics.Metrics, logger *slog.Logger) *Node {
 	s := store.New()
-	peersMu := &sync.RWMutex{}
 
 	// Build hash ring with all nodes (self + peers)
 	hashRing := ring.NewHashRing(virtualNodes)
@@ -35,17 +37,20 @@ func New(id, addr string, peers map[string]string, virtualNodes int, m *metrics.
 	}
 	hashRing.Rebuild(nodeList)
 
-	r := router.New(id, peers, peersMu, s, hashRing, logger)
-	rebalancer := rebalance.New(id, hashRing, s, peers, peersMu, m, logger, 10)
+	member := membership.New(id, peers, hashRing, nil, m, logger, heartbeatInterval, heartbeatTimeout)
+	r := router.New(id, peers, member.PeerLock(), s, hashRing, logger)
+	rebalancer := rebalance.New(id, hashRing, s, peers, member.PeerLock(), m, logger, 10)
+	member.Rebalancer = rebalancer
 
 	return &Node{
 		ID:         id,
 		Addr:       addr,
 		Peers:      peers,
-		PeersMu:    peersMu,
+		PeersMu:    member.PeerLock(),
 		Store:      s,
 		Router:     r,
 		Ring:       hashRing,
 		Rebalancer: rebalancer,
+		Membership: member,
 	}
 }

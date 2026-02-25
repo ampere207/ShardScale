@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"shardscale/internal/metrics"
 	"shardscale/internal/rebalance"
@@ -42,6 +43,11 @@ type joinRequest struct {
 	NodeAddr string `json:"node_addr"`
 }
 
+type heartbeatResponse struct {
+	NodeID    string `json:"node_id"`
+	Timestamp int64  `json:"timestamp"`
+}
+
 type Handlers struct {
 	router     *router.Router
 	rebalancer *rebalance.Rebalancer
@@ -59,6 +65,7 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/health", h.handleHealth)
 	mux.HandleFunc("/internal/transfer", h.handleInternalTransfer)
 	mux.HandleFunc("/internal/join", h.handleInternalJoin)
+	mux.HandleFunc("/internal/heartbeat", h.handleInternalHeartbeat)
 }
 
 func (h *Handlers) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -173,7 +180,8 @@ func (h *Handlers) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, h.metrics.Snapshot(h.router.Count()))
+	activeNodes := len(h.router.PeerSnapshot())
+	writeJSON(w, http.StatusOK, h.metrics.Snapshot(h.router.Count(), activeNodes))
 }
 
 func (h *Handlers) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -261,6 +269,7 @@ func (h *Handlers) handleInternalJoin(w http.ResponseWriter, r *http.Request) {
 
 	changed := h.router.AddOrUpdatePeer(req.NodeID, req.NodeAddr)
 	if changed {
+		h.metrics.IncMembershipChanges()
 		h.rebalancer.RebuildRingFromPeers()
 		h.rebalancer.StartRebalance()
 		h.logger.Info("cluster join processed",
@@ -270,6 +279,19 @@ func (h *Handlers) handleInternalJoin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+func (h *Handlers) handleInternalHeartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, heartbeatResponse{
+		NodeID:    h.router.SelfID,
+		Timestamp: time.Now().UnixMilli(),
+	})
 }
 
 func parseKey(path string) (string, bool) {

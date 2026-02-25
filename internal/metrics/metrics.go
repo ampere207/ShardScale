@@ -15,6 +15,8 @@ type Metrics struct {
 	KeysMigrated        atomic.Int64
 	MigrationStartedAt  atomic.Int64
 	MigrationDurationMs atomic.Int64
+	FailedNodesDetected atomic.Uint64
+	MembershipChanges   atomic.Uint64
 }
 
 type Snapshot struct {
@@ -24,17 +26,20 @@ type Snapshot struct {
 	TotalWrites         uint64 `json:"total_writes"`
 	FailedRequests      uint64 `json:"failed_requests"`
 	TotalKeys           int    `json:"total_keys"`
+	ActiveNodes         int    `json:"active_nodes"`
 	RebalanceInProgress bool   `json:"rebalance_in_progress"`
 	KeysMigrated        int64  `json:"keys_migrated"`
 	MigrationStartedAt  int64  `json:"migration_started_at"`
 	MigrationDurationMs int64  `json:"migration_duration_ms"`
+	FailedNodesDetected uint64 `json:"failed_nodes_detected"`
+	MembershipChanges   uint64 `json:"membership_changes"`
 }
 
 func New() *Metrics {
 	return &Metrics{StartTime: time.Now()}
 }
 
-func (m *Metrics) Snapshot(totalKeys int) Snapshot {
+func (m *Metrics) Snapshot(totalKeys int, activeNodes int) Snapshot {
 	uptime := int64(time.Since(m.StartTime).Seconds())
 	if uptime < 0 {
 		uptime = 0
@@ -47,10 +52,13 @@ func (m *Metrics) Snapshot(totalKeys int) Snapshot {
 		TotalWrites:         m.TotalWrites.Load(),
 		FailedRequests:      m.FailedRequests.Load(),
 		TotalKeys:           totalKeys,
+		ActiveNodes:         activeNodes,
 		RebalanceInProgress: m.RebalanceInProgress.Load(),
 		KeysMigrated:        m.KeysMigrated.Load(),
 		MigrationStartedAt:  m.MigrationStartedAt.Load(),
 		MigrationDurationMs: m.MigrationDurationMs.Load(),
+		FailedNodesDetected: m.FailedNodesDetected.Load(),
+		MembershipChanges:   m.MembershipChanges.Load(),
 	}
 }
 
@@ -70,4 +78,12 @@ func (m *Metrics) MarkRebalanceCompleted(start time.Time, duration time.Duration
 	m.KeysMigrated.Store(migrated)
 	m.MigrationStartedAt.Store(start.UnixMilli())
 	m.MigrationDurationMs.Store(duration.Milliseconds())
+}
+
+func (m *Metrics) IncFailedNodesDetected() {
+	m.FailedNodesDetected.Add(1)
+}
+
+func (m *Metrics) IncMembershipChanges() {
+	m.MembershipChanges.Add(1)
 }
