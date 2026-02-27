@@ -65,6 +65,7 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/health", h.handleHealth)
 	mux.HandleFunc("/internal/transfer", h.handleInternalTransfer)
 	mux.HandleFunc("/internal/replicate", h.handleInternalReplicate)
+	mux.HandleFunc("/internal/read/", h.handleInternalRead)
 	mux.HandleFunc("/internal/join", h.handleInternalJoin)
 	mux.HandleFunc("/internal/heartbeat", h.handleInternalHeartbeat)
 }
@@ -295,6 +296,43 @@ func (h *Handlers) handleInternalReplicate(w http.ResponseWriter, r *http.Reques
 	}
 
 	writeJSON(w, http.StatusOK, statusResponse{Status: "ok"})
+}
+
+func (h *Handlers) handleInternalRead(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	const prefix = "/internal/read/"
+	if !strings.HasPrefix(r.URL.Path, prefix) {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "missing key"})
+		return
+	}
+
+	key := strings.TrimSpace(strings.TrimPrefix(r.URL.Path, prefix))
+	if key == "" || strings.Contains(key, "/") {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid key"})
+		return
+	}
+
+	value, err := h.router.DirectGet(r.Context(), key)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			writeJSON(w, http.StatusNotFound, errorResponse{Error: "key not found"})
+			return
+		}
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			writeJSON(w, http.StatusRequestTimeout, errorResponse{Error: err.Error()})
+			return
+		}
+		h.metrics.FailedRequests.Add(1)
+		writeJSON(w, http.StatusBadGateway, errorResponse{Error: "failed to read replica"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, getResponse{Key: key, Value: value})
 }
 
 func (h *Handlers) handleInternalJoin(w http.ResponseWriter, r *http.Request) {

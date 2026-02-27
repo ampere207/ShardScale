@@ -32,6 +32,8 @@ func main() {
 	peersStr := flag.String("peers", os.Getenv("PEERS"), "Peers in format node2=addr2,node3=addr3")
 	virtualNodesStr := flag.String("virtual-nodes", os.Getenv("VIRTUAL_NODES"), "Virtual nodes per physical node (default 50)")
 	replicationFactorStr := flag.String("replication-factor", os.Getenv("REPLICATION_FACTOR"), "Replication factor (default 2)")
+	writeQuorumStr := flag.String("write-quorum", os.Getenv("WRITE_QUORUM"), "Write quorum (default replication factor)")
+	readQuorumStr := flag.String("read-quorum", os.Getenv("READ_QUORUM"), "Read quorum (default 1)")
 	heartbeatIntervalStr := flag.String("heartbeat-interval", os.Getenv("HEARTBEAT_INTERVAL"), "Heartbeat interval (default 2s)")
 	heartbeatTimeoutStr := flag.String("heartbeat-timeout", os.Getenv("HEARTBEAT_TIMEOUT"), "Heartbeat timeout (default 6s)")
 	flag.Parse()
@@ -60,6 +62,54 @@ func main() {
 			os.Exit(1)
 		}
 		replicationFactor = parsed
+	}
+
+	writeQuorum := replicationFactor
+	if *writeQuorumStr != "" {
+		parsed, err := strconv.Atoi(*writeQuorumStr)
+		if err != nil || parsed < 1 {
+			logger.Error("invalid write quorum",
+				slog.String("value", *writeQuorumStr),
+			)
+			os.Exit(1)
+		}
+		writeQuorum = parsed
+	}
+
+	readQuorum := 1
+	if *readQuorumStr != "" {
+		parsed, err := strconv.Atoi(*readQuorumStr)
+		if err != nil || parsed < 1 {
+			logger.Error("invalid read quorum",
+				slog.String("value", *readQuorumStr),
+			)
+			os.Exit(1)
+		}
+		readQuorum = parsed
+	}
+
+	if writeQuorum > replicationFactor {
+		logger.Error("invalid quorum configuration: write quorum cannot exceed replication factor",
+			slog.Int("write_quorum", writeQuorum),
+			slog.Int("replication_factor", replicationFactor),
+		)
+		os.Exit(1)
+	}
+
+	if readQuorum > replicationFactor {
+		logger.Error("invalid quorum configuration: read quorum cannot exceed replication factor",
+			slog.Int("read_quorum", readQuorum),
+			slog.Int("replication_factor", replicationFactor),
+		)
+		os.Exit(1)
+	}
+
+	if readQuorum+writeQuorum <= replicationFactor {
+		logger.Warn("weak quorum configuration detected: R + W <= N may allow stale reads",
+			slog.Int("read_quorum", readQuorum),
+			slog.Int("write_quorum", writeQuorum),
+			slog.Int("replication_factor", replicationFactor),
+		)
 	}
 
 	// Parse heartbeat timings
@@ -115,6 +165,8 @@ func main() {
 		slog.Any("peers", peers),
 		slog.Int("virtual_nodes", virtualNodes),
 		slog.Int("replication_factor", replicationFactor),
+		slog.Int("write_quorum", writeQuorum),
+		slog.Int("read_quorum", readQuorum),
 		slog.Duration("heartbeat_interval", heartbeatInterval),
 		slog.Duration("heartbeat_timeout", heartbeatTimeout),
 	)
@@ -125,7 +177,9 @@ func main() {
 	// Create node with hash ring
 	metricCollector := metrics.New()
 	metricCollector.SetReplicationFactor(replicationFactor)
-	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, replicationFactor, heartbeatInterval, heartbeatTimeout, metricCollector, logger)
+	metricCollector.SetWriteQuorum(writeQuorum)
+	metricCollector.SetReadQuorum(readQuorum)
+	n := node.New(*nodeID, *nodeAddr, peers, virtualNodes, replicationFactor, writeQuorum, readQuorum, heartbeatInterval, heartbeatTimeout, metricCollector, logger)
 
 	// Create handlers
 	handlers := api.NewHandlers(n.Router, n.Rebalancer, metricCollector, logger)
