@@ -26,6 +26,10 @@ type Metrics struct {
 	MigrationDurationMs    atomic.Int64
 	FailedNodesDetected    atomic.Uint64
 	MembershipChanges      atomic.Uint64
+	// Raft consensus metrics
+	RaftCurrentTerm atomic.Int64
+	RaftCommitIndex atomic.Int64
+	RaftLogLength   atomic.Int64
 }
 
 type Snapshot struct {
@@ -51,6 +55,10 @@ type Snapshot struct {
 	MigrationDurationMs    int64  `json:"migration_duration_ms"`
 	FailedNodesDetected    uint64 `json:"failed_nodes_detected"`
 	MembershipChanges      uint64 `json:"membership_changes"`
+	// Raft consensus metrics
+	RaftCurrentTerm int64 `json:"raft_current_term"`
+	RaftCommitIndex int64 `json:"raft_commit_index"`
+	RaftLogLength   int64 `json:"raft_log_length"`
 }
 
 func New() *Metrics {
@@ -113,6 +121,9 @@ func (m *Metrics) Snapshot(totalKeys int, activeNodes int, replicationFactor int
 		MigrationDurationMs:    m.MigrationDurationMs.Load(),
 		FailedNodesDetected:    m.FailedNodesDetected.Load(),
 		MembershipChanges:      m.MembershipChanges.Load(),
+		RaftCurrentTerm:        m.RaftCurrentTerm.Load(),
+		RaftCommitIndex:        m.RaftCommitIndex.Load(),
+		RaftLogLength:          m.RaftLogLength.Load(),
 	}
 }
 
@@ -193,4 +204,17 @@ func (m *Metrics) IncSuccessfulQuorumWritesTotal() {
 
 func (m *Metrics) IncSuccessfulQuorumReadsTotal() {
 	m.SuccessfulQuorumReads.Add(1)
+}
+
+// Raft consensus metrics methods
+func (m *Metrics) SetRaftCurrentTerm(term int64) {
+	m.RaftCurrentTerm.Store(term)
+}
+
+func (m *Metrics) SetRaftCommitIndex(commitIndex int64) {
+	m.RaftCommitIndex.Store(commitIndex)
+}
+
+func (m *Metrics) SetRaftLogLength(logLength int64) {
+	m.RaftLogLength.Store(logLength)
 }

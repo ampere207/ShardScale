@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"shardscale/internal/metrics"
+	"shardscale/internal/raft"
 	"shardscale/internal/rebalance"
 	"shardscale/internal/router"
 	"shardscale/internal/store"
@@ -53,10 +54,11 @@ type Handlers struct {
 	rebalancer *rebalance.Rebalancer
 	metrics    *metrics.Metrics
 	logger     *slog.Logger
+	raftNode   interface{} // *raft.RaftNode to avoid circular import
 }
 
 func NewHandlers(r *router.Router, rb *rebalance.Rebalancer, m *metrics.Metrics, logger *slog.Logger) *Handlers {
-	return &Handlers{router: r, rebalancer: rb, metrics: m, logger: logger}
+	return &Handlers{router: r, rebalancer: rb, metrics: m, logger: logger, raftNode: nil}
 }
 
 func (h *Handlers) Register(mux *http.ServeMux) {
@@ -68,6 +70,13 @@ func (h *Handlers) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/internal/read/", h.handleInternalRead)
 	mux.HandleFunc("/internal/join", h.handleInternalJoin)
 	mux.HandleFunc("/internal/heartbeat", h.handleInternalHeartbeat)
+	// Raft RPC endpoints
+	mux.HandleFunc("/raft/requestVote", h.handleRaftRequestVote)
+	mux.HandleFunc("/raft/appendEntries", h.handleRaftAppendEntries)
+}
+
+func (h *Handlers) SetRaftNode(raftNode interface{}) {
+	h.raftNode = raftNode
 }
 
 func (h *Handlers) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -409,4 +418,68 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// Raft RPC handlers
+
+func (h *Handlers) handleRaftRequestVote(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if h.raftNode == nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "raft not configured"})
+		return
+	}
+
+	raftNode, ok := h.raftNode.(*raft.RaftNode)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "invalid raft node"})
+		return
+	}
+
+	defer r.Body.Close()
+
+	var req raft.RequestVoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON"})
+		return
+	}
+
+	resp := &raft.RequestVoteResponse{}
+	raftNode.RequestVoteHandler(&req, resp)
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (h *Handlers) handleRaftAppendEntries(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, errorResponse{Error: "method not allowed"})
+		return
+	}
+
+	if h.raftNode == nil {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "raft not configured"})
+		return
+	}
+
+	raftNode, ok := h.raftNode.(*raft.RaftNode)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, errorResponse{Error: "invalid raft node"})
+		return
+	}
+
+	defer r.Body.Close()
+
+	var req raft.AppendEntriesRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, errorResponse{Error: "invalid JSON"})
+		return
+	}
+
+	resp := &raft.AppendEntriesResponse{}
+	raftNode.AppendEntriesHandler(&req, resp)
+
+	writeJSON(w, http.StatusOK, resp)
 }

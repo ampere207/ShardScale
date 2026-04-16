@@ -15,15 +15,17 @@ import (
 
 // Node represents a cluster node with its identity, peers, and routing/storage components.
 type Node struct {
-	ID         string
-	Addr       string
-	Peers      map[string]string // nodeID -> address
-	PeersMu    *sync.RWMutex
-	Store      *store.Store
-	Router     *router.Router
-	Ring       *ring.HashRing
-	Rebalancer *rebalance.Rebalancer
-	Membership *membership.Membership
+	ID              string
+	Addr            string
+	Peers           map[string]string // nodeID -> address
+	PeersMu         *sync.RWMutex
+	Store           *store.Store
+	Router          *router.Router
+	Ring            *ring.HashRing
+	Rebalancer      *rebalance.Rebalancer
+	Membership      *membership.Membership
+	RaftNode        interface{} // *raft.RaftNode to avoid circular import
+	ConsistencyMode string      // "quorum" or "raft"
 }
 
 func New(id, addr string, peers map[string]string, virtualNodes int, replicationFactor int, writeQuorum int, readQuorum int, heartbeatInterval, heartbeatTimeout time.Duration, m *metrics.Metrics, logger *slog.Logger) *Node {
@@ -43,14 +45,34 @@ func New(id, addr string, peers map[string]string, virtualNodes int, replication
 	member.Rebalancer = rebalancer
 
 	return &Node{
-		ID:         id,
-		Addr:       addr,
-		Peers:      peers,
-		PeersMu:    member.PeerLock(),
-		Store:      s,
-		Router:     r,
-		Ring:       hashRing,
-		Rebalancer: rebalancer,
-		Membership: member,
+		ID:              id,
+		Addr:            addr,
+		Peers:           peers,
+		PeersMu:         member.PeerLock(),
+		Store:           s,
+		Router:          r,
+		Ring:            hashRing,
+		Rebalancer:      rebalancer,
+		Membership:      member,
+		RaftNode:        nil,
+		ConsistencyMode: "quorum",
 	}
+}
+
+// SetRaftNode sets the Raft node for consensus-based operations.
+func (n *Node) SetRaftNode(raftNode interface{}) {
+	n.RaftNode = raftNode
+	n.Router.SetRaftNode(raftNode)
+}
+
+// EnableRaftMode enables Raft-based consensus mode (CP).
+func (n *Node) EnableRaftMode() {
+	n.ConsistencyMode = "raft"
+	n.Router.SetConsistencyMode("raft")
+}
+
+// DisableRaftMode disables Raft-based consensus mode (reverts to quorum-based AP).
+func (n *Node) DisableRaftMode() {
+	n.ConsistencyMode = "quorum"
+	n.Router.SetConsistencyMode("quorum")
 }

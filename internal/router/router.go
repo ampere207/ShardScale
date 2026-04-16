@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"shardscale/internal/metrics"
+	"shardscale/internal/raft"
 	"shardscale/internal/ring"
 	"shardscale/internal/store"
 )
@@ -32,6 +33,9 @@ type Router struct {
 	metrics           *metrics.Metrics
 	httpClient        *http.Client
 	logger            *slog.Logger
+	// Raft integration
+	raftNode        interface{} // *raft.RaftNode to avoid circular import
+	consistencyMode string      // "quorum" or "raft"
 }
 
 type StatusError struct {
@@ -78,8 +82,19 @@ func New(selfID string, peers map[string]string, peersMu *sync.RWMutex, s *store
 		httpClient: &http.Client{
 			Timeout: 3 * time.Second,
 		},
-		logger: logger,
+		logger:          logger,
+		consistencyMode: "quorum",
 	}
+}
+
+// SetRaftNode sets the Raft node for consensus-based operations.
+func (r *Router) SetRaftNode(raftNode interface{}) {
+	r.raftNode = raftNode
+}
+
+// SetConsistencyMode sets the consistency mode: "quorum" or "raft".
+func (r *Router) SetConsistencyMode(mode string) {
+	r.consistencyMode = mode
 }
 
 // KeyOwner determines which node owns the given key using consistent hashing.
@@ -96,8 +111,58 @@ func (r *Router) KeyOwner(key string) string {
 	return owners[0]
 }
 
-// Put performs a quorum write across owners for the key.
+// Put performs a write across owners for the key.
+// In quorum mode: performs quorum write
+// In raft mode: delegates to Raft consensus
 func (r *Router) Put(ctx context.Context, key, value string) error {
+	if r.consistencyMode == "raft" && r.raftNode != nil {
+		return r.putRaft(ctx, key, value)
+	}
+	return r.putQuorum(ctx, key, value)
+}
+
+// putRaft performs a write using Raft consensus.
+func (r *Router) putRaft(ctx context.Context, key, value string) error {
+	// Type assertion to *raft.RaftNode
+	raftNode, ok := r.raftNode.(*raft.RaftNode)
+	if !ok {
+		return fmt.Errorf("invalid raft node")
+	}
+
+	// Check if we're the leader
+	_, _, isLeader := raftNode.GetState()
+	if !isLeader {
+		leaderID := raftNode.GetLeaderID()
+		if leaderID == "" {
+			return fmt.Errorf("no leader elected")
+		}
+		// In a full implementation, we'd forward to leader here
+		// For now, just return error to client
+		return fmt.Errorf("not leader, leader is %s", leaderID)
+	}
+
+	// Append entry to log
+	ok, err := raftNode.AppendEntry(key, []byte(value))
+	if err != nil || !ok {
+		return fmt.Errorf("failed to append entry: %v", err)
+	}
+
+	logIndex := raftNode.GetLogLength() - 1
+
+	// Wait for replication
+	if !raftNode.WaitForReplication(logIndex, 3*time.Second) {
+		return fmt.Errorf("failed to reach consensus for write")
+	}
+
+	if r.metrics != nil {
+		r.metrics.IncSuccessfulQuorumWritesTotal()
+	}
+
+	return nil
+}
+
+// putQuorum performs a quorum write across owners for the key.
+func (r *Router) putQuorum(ctx context.Context, key, value string) error {
 	owners := r.getOwners(key)
 	if len(owners) == 0 {
 		owners = []string{r.SelfID}
@@ -220,6 +285,37 @@ func (r *Router) Put(ctx context.Context, key, value string) error {
 
 // Get performs a quorum read across owners for the key.
 func (r *Router) Get(ctx context.Context, key string) (string, error) {
+	if r.consistencyMode == "raft" && r.raftNode != nil {
+		return r.getRaft(ctx, key)
+	}
+	return r.getQuorum(ctx, key)
+}
+
+// getRaft performs a read using Raft consensus (from leader only).
+func (r *Router) getRaft(ctx context.Context, key string) (string, error) {
+	// Type assertion to *raft.RaftNode
+	raftNode, ok := r.raftNode.(*raft.RaftNode)
+	if !ok {
+		return "", fmt.Errorf("invalid raft node")
+	}
+
+	// Only leader can serve reads for linearizability
+	_, _, isLeader := raftNode.GetState()
+	if !isLeader {
+		leaderID := raftNode.GetLeaderID()
+		if leaderID == "" {
+			return "", fmt.Errorf("no leader elected")
+		}
+		// In a full implementation, we'd forward to leader here
+		return "", fmt.Errorf("not leader, leader is %s", leaderID)
+	}
+
+	// Serve from local state machine (which has all committed entries applied)
+	return r.store.Get(ctx, key)
+}
+
+// getQuorum performs a quorum read across owners for the key.
+func (r *Router) getQuorum(ctx context.Context, key string) (string, error) {
 	owners := r.getOwners(key)
 	if len(owners) == 0 {
 		owners = []string{r.SelfID}
