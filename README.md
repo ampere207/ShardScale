@@ -6,9 +6,11 @@ ShardScale is a distributed in-memory key-value store written in Go, built to de
 - Dynamic membership with heartbeat-based failure detection
 - Background data rebalancing on topology change
 - Replication across owners
+- **Dual consistency modes**: Quorum-based (AP) or Raft-based (CP)
 - Tunable quorum consistency (`N`, `W`, `R`) for reads and writes
+- **Raft consensus** with automatic leader election and log replication
 
-> Current implementation scope: **Phases 0–6** (through quorum reads/writes).
+> Current implementation scope: **Phases 0–6** (quorum reads/writes) + **Raft consensus module**
 
 ---
 
@@ -30,9 +32,12 @@ This makes it useful for learning, benchmarking, and interview discussion.
 - **Replication-aware owner selection** (`GetOwners(key, N)`)
 - **Quorum writes** with fast-fail and timeout bounds (`internal/router`)
 - **Quorum reads** with parallel fan-out and not-found quorum handling
+- **Raft consensus** with leader election, log replication, and state machine application (`internal/raft`)
+- **Leader-based reads/writes** in Raft mode for linearizability
+- **Dual consistency modes**: Switch between AP (quorum) and CP (Raft) at runtime
 - **Topology updates** on node join/failure (`internal/membership`)
 - **Live rebalance** with bounded worker pool and safe-delete checks (`internal/rebalance`)
-- **Operational metrics** with atomic counters (`/metrics`)
+- **Operational metrics** with atomic counters including Raft state (`/metrics`)
 
 ---
 
@@ -42,35 +47,51 @@ Each node runs the same stack:
 
 1. HTTP server
 2. API handlers
-3. Router (quorum coordinator)
-4. Local store (`map + RWMutex`)
-5. Consistent hash ring
-6. Membership monitor (heartbeats)
-7. Rebalancer
-8. Metrics collector
+3. Router (quorum or Raft coordinator, based on mode)
+4. **Raft consensus engine** (if Raft mode enabled)
+5. Local store (`map + RWMutex`)
+6. Consistent hash ring
+7. Membership monitor (heartbeats)
+8. Rebalancer
+9. Metrics collector
 
 Composition entry points:
 
 - `cmd/server/main.go`
 - `internal/node/node.go`
+- `internal/raft/raft.go` (new)
 
 ---
 
-## Consistency model (`N`, `W`, `R`)
+## Consistency modes
+
+### Quorum Mode (Default - AP)
 
 - `N` = replication factor (`REPLICATION_FACTOR`)
 - `W` = write quorum (`WRITE_QUORUM`)
 - `R` = read quorum (`READ_QUORUM`)
+- Leaderless architecture
+- Tunable consistency: eventual to strong (if W + R > N)
 
-### Startup validation
-
+**Startup validation**
 - `W > N` => startup error
 - `R > N` => startup error
 - `R + W <= N` => startup warning (weak consistency profile)
 
-### Practical rule
+### Raft Mode (CP)
 
-If `R + W > N`, read and write sets overlap under normal operation, reducing stale-read risk.
+- **Automatic leader election** with randomized timeouts (150-300ms)
+- **Log replication** to majority before commit
+- **Linearizable writes** (all through leader)
+- **Strong consistency** reads (from leader only)
+- **Automatic failover** (< 500ms to new leader)
+- Enable with: `CONSISTENCY_MODE=raft`
+
+**Trade-offs**
+- CP model: Consistency over availability
+- Minority partition cannot accept writes
+- All writes/reads through leader (higher latency)
+- Stronger safety guarantees
 
 ---
 
@@ -80,13 +101,20 @@ If `R + W > N`, read and write sets overlap under normal operation, reducing sta
 
 - Go 1.22+
 
-### Single node
+### Single node (Quorum mode)
 
 ```bash
 NODE_ID=node1 NODE_ADDR=localhost:8080 PEERS=node1=localhost:8080 \
 VIRTUAL_NODES=50 REPLICATION_FACTOR=1 WRITE_QUORUM=1 READ_QUORUM=1 \
 HEARTBEAT_INTERVAL=2s HEARTBEAT_TIMEOUT=6s \
 go run ./cmd/server
+```
+
+### Single node (Raft mode)
+
+```bash
+CONSISTENCY_MODE=raft NODE_ID=node1 NODE_ADDR=localhost:8080 \
+PEERS=node1=localhost:8080 go run ./cmd/server
 ```
 
 ### 3-node cluster (`N=3, W=2, R=2`)
@@ -120,6 +148,30 @@ HEARTBEAT_INTERVAL=2s HEARTBEAT_TIMEOUT=6s \
 go run ./cmd/server
 ```
 
+### 3-node cluster (Raft mode - Strong Consistency)
+
+Run each command in a separate terminal. Raft automatically elects a leader within ~500ms.
+
+**Node 1**
+```bash
+CONSISTENCY_MODE=raft NODE_ID=node1 NODE_ADDR=localhost:8080 \
+PEERS=node2=localhost:8081,node3=localhost:8082 go run ./cmd/server
+```
+
+**Node 2**
+```bash
+CONSISTENCY_MODE=raft NODE_ID=node2 NODE_ADDR=localhost:8081 \
+PEERS=node1=localhost:8080,node3=localhost:8082 go run ./cmd/server
+```
+
+**Node 3**
+```bash
+CONSISTENCY_MODE=raft NODE_ID=node3 NODE_ADDR=localhost:8082 \
+PEERS=node1=localhost:8080,node2=localhost:8081 go run ./cmd/server
+```
+
+Wait ~500ms for leader election, then continue with API calls.
+
 ---
 
 ## API
@@ -130,6 +182,11 @@ go run ./cmd/server
 - `GET /kv/{key}`
 - `GET /metrics`
 - `GET /health`
+
+### Raft RPC endpoints (Raft mode only)
+
+- `POST /raft/requestVote` - Internal Raft election RPC
+- `POST /raft/appendEntries` - Internal Raft log replication RPC
 
 ### Internal endpoints
 
